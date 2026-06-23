@@ -49,7 +49,7 @@ sns.set_style("whitegrid")
 """Configurar credenciais do Kaggle para baixar o dataset:"""
 
 # Configurar token do Kaggle
-os.environ["KAGGLE_API_TOKEN"] = '{"username":"joaovitorarroyo","key":"KGAT_c09328b129391d106fc75988fca39a94"}'
+os.environ["KAGGLE_API_TOKEN"] = '{"username":"seu_user","key":"Sua_Key"}'
 
 # Configurar para o kaggle CLI encontrar as credenciais
 token = json.loads(os.environ["KAGGLE_API_TOKEN"])

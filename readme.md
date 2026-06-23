@@ -1,9 +1,3 @@
----
-
-### 1. Crie o arquivo `README.md`
-Copie o conteúdo abaixo e salve como `README.md` na raiz do seu repositório anônimo.
-
-```markdown
 # A Supervised Machine Learning Framework for Sports Championship Prediction
 **Supplementary Material for ENIAC 2026 (Double-Blind Submission)**
 

@@ -18,7 +18,8 @@
 Instalar bibliotecas necessárias:
 """
 
-!pip install basketball-reference-scraper requests beautifulsoup4 lxml -q
+import matplotlib
+matplotlib.use("Agg")
 
 import pandas as pd
 import numpy as np
@@ -63,7 +64,13 @@ print("Token configurado!")
 """### **Carregamento do dataset e pré-processamento dos dados**"""
 
 # Baixar dataset NBA
-!kaggle datasets download -d sumitrodatta/nba-aba-baa-stats -p nba_data/ --unzip -q
+import subprocess
+if not os.path.exists("nba_data/Team Summaries.csv"):
+    subprocess.run(
+        ["kaggle", "datasets", "download", "-d", "sumitrodatta/nba-aba-baa-stats",
+         "-p", "nba_data/", "--unzip", "-q"],
+        check=True,
+    )
 import glob
 
 print("Dataset baixado!")
@@ -406,7 +413,7 @@ def treinar_modelos(target):
         Xtr = X_tr_sc if nome in usa_escala else X_train.values
         Xte = X_te_sc if nome in usa_escala else X_test.values
 
-        gs = GridSearchCV(modelo, grid, cv=tscv, scoring="roc_auc", n_jobs=-1)
+        gs = GridSearchCV(modelo, grid, cv=tscv, scoring="roc_auc", n_jobs=1)
         gs.fit(Xtr, y_train)
 
         melhor = gs.best_estimator_
@@ -573,6 +580,162 @@ def tabela_resumo_cm(resultados, y_test, nome_target):
 
 resumo_finals = tabela_resumo_cm(resultados_finals, y_test_finals, "Finalistas")
 resumo_champ  = tabela_resumo_cm(resultados_champ,  y_test_champ,  "Campeão")
+
+"""## Statistical validation: DeLong test, McNemar test, Bootstrap CI, Walk-forward"""
+
+from scipy import stats
+from statsmodels.stats.contingency_tables import mcnemar as _mcnemar
+
+def _compute_midrank(x):
+    J = np.argsort(x)
+    Z = x[J]
+    N = len(x)
+    T = np.zeros(N, dtype=float)
+    i = 0
+    while i < N:
+        j = i
+        while j < N and Z[j] == Z[i]:
+            j += 1
+        T[i:j] = 0.5 * (i + j - 1) + 1
+        i = j
+    T2 = np.empty(N, dtype=float)
+    T2[J] = T
+    return T2
+
+def _fastDeLong(predictions_sorted_transposed, label_1_count):
+    m = label_1_count
+    n = predictions_sorted_transposed.shape[1] - m
+    positive_examples = predictions_sorted_transposed[:, :m]
+    negative_examples = predictions_sorted_transposed[:, m:]
+    k = predictions_sorted_transposed.shape[0]
+    tx = np.empty([k, m], dtype=float)
+    ty = np.empty([k, n], dtype=float)
+    tz = np.empty([k, m + n], dtype=float)
+    for r in range(k):
+        tx[r, :] = _compute_midrank(positive_examples[r, :])
+        ty[r, :] = _compute_midrank(negative_examples[r, :])
+        tz[r, :] = _compute_midrank(predictions_sorted_transposed[r, :])
+    aucs = tz[:, :m].sum(axis=1) / m / n - float(m + 1) / 2.0 / n
+    v01 = (tz[:, :m] - tx[:, :]) / n
+    v10 = 1.0 - (tz[:, m:] - ty[:, :]) / m
+    sx = np.cov(v01)
+    sy = np.cov(v10)
+    delongcov = sx / m + sy / n
+    return aucs, delongcov
+
+def delong_roc_test(y_true, prob_a, prob_b):
+    """Two-sided DeLong test for the difference between two correlated AUCs."""
+    y_true = np.array(y_true)
+    order = np.argsort(-y_true, kind="mergesort")
+    y_sorted = y_true[order]
+    m = int(np.sum(y_sorted == 1))
+    pa = np.array(prob_a)[order]
+    pb = np.array(prob_b)[order]
+    preds = np.vstack([pa, pb])
+    aucs, cov = _fastDeLong(preds, m)
+    diff = aucs[0] - aucs[1]
+    var = cov[0, 0] + cov[1, 1] - 2 * cov[0, 1]
+    if var <= 0:
+        return aucs[0], aucs[1], 1.0
+    z = diff / np.sqrt(var)
+    p = 2 * (1 - stats.norm.cdf(abs(z)))
+    return aucs[0], aucs[1], p
+
+def bootstrap_auc_ci(y_true, y_prob, n_boot=2000, ci=0.95, seed=42):
+    """Bootstrap percentile CI for AUC-ROC (mirrors the World Cup pipeline)."""
+    rng = np.random.RandomState(seed)
+    aucs = []
+    y_true = np.array(y_true); y_prob = np.array(y_prob)
+    n = len(y_true)
+    for _ in range(n_boot):
+        idx = rng.randint(0, n, n)
+        yt, yp = y_true[idx], y_prob[idx]
+        if yt.sum() == 0 or yt.sum() == len(yt):
+            continue
+        aucs.append(roc_auc_score(yt, yp))
+    aucs = np.array(aucs)
+    alpha = (1 - ci) / 2
+    return np.mean(aucs), np.percentile(aucs, 100 * alpha), np.percentile(aucs, 100 * (1 - alpha)), len(aucs)
+
+def run_mcnemar(y_true, pred1, pred2, name1, name2):
+    b = int(np.sum((pred1 == y_true) & (pred2 != y_true)))
+    c = int(np.sum((pred1 != y_true) & (pred2 == y_true)))
+    if b + c == 0:
+        print(f"  {name1} vs {name2}: no discordant pairs — N/A")
+        return None
+    table = [[0, b], [c, 0]]
+    result = _mcnemar(table, exact=(b + c < 25))
+    print(f"  {name1:<22} vs {name2:<22}  b={b}, c={c}  p={result.pvalue:.4f}")
+    return b, c, result.pvalue
+
+REFERENCE_MODEL_NBA = "Logistic Regression"
+y_true_champ = y_test_champ.values
+
+print(f"\n=== Bootstrap 95% CI (n_boot=2000) — Champion ===")
+ci_results_nba = {}
+for nome, res in resultados_champ.items():
+    m_, lo, hi, nv = bootstrap_auc_ci(y_true_champ, res["y_prob"])
+    ci_results_nba[nome] = (res["auc"], lo, hi)
+    print(f"  {nome:<23}  {res['auc']:.3f}   [{lo:.3f} - {hi:.3f}]   ({nv})")
+
+print(f"\n=== DeLong Test — Champion, reference = {REFERENCE_MODEL_NBA} ===")
+delong_results_nba = {}
+ref_prob = resultados_champ[REFERENCE_MODEL_NBA]["y_prob"]
+for nome, res in resultados_champ.items():
+    if nome == REFERENCE_MODEL_NBA:
+        delong_results_nba[nome] = None
+        continue
+    auc_ref, auc_m, p = delong_roc_test(y_true_champ, ref_prob, res["y_prob"])
+    delong_results_nba[nome] = p
+    print(f"  {REFERENCE_MODEL_NBA:<20} vs {nome:<20}  AUC {auc_ref:.3f} vs {auc_m:.3f}  p={p:.4f}")
+
+print(f"\n=== McNemar Test — Champion, reference = {REFERENCE_MODEL_NBA} ===")
+mcnemar_results_nba = {}
+ref_pred = resultados_champ[REFERENCE_MODEL_NBA]["y_pred"]
+for nome, res in resultados_champ.items():
+    if nome == REFERENCE_MODEL_NBA:
+        continue
+    mcnemar_results_nba[nome] = run_mcnemar(y_true_champ, ref_pred, res["y_pred"],
+                                             REFERENCE_MODEL_NBA, nome)
+
+print(f"\n=== Walk-forward analysis (Logistic Regression, champion) ===")
+print("Cut point = last training season; test window = next 7 seasons "
+      "(same width as the primary test set, for comparability).")
+walk_forward_results = {}
+for cut in [2015, 2016, 2017]:
+    tr_w = data[data["Season"] <= cut]
+    te_w = data[(data["Season"] > cut) & (data["Season"] <= cut + 7)]
+    if te_w["champion"].sum() == 0:
+        print(f"  cut={cut}: test window has 0 champions — skipped")
+        continue
+    sc_w = StandardScaler()
+    Xtr_w = sc_w.fit_transform(tr_w[FEATURE_COLS])
+    Xte_w = sc_w.transform(te_w[FEATURE_COLS])
+    gs_w = GridSearchCV(
+        LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42),
+        {"C": [0.01, 0.1, 1, 10]}, cv=TimeSeriesSplit(n_splits=5), scoring="roc_auc", n_jobs=1,
+    )
+    gs_w.fit(Xtr_w, tr_w["champion"])
+    y_prob_w = gs_w.best_estimator_.predict_proba(Xte_w)[:, 1]
+    auc_w = roc_auc_score(te_w["champion"], y_prob_w)
+    walk_forward_results[cut] = auc_w
+    print(f"  cut={cut}  train={sorted(tr_w['Season'].unique())[-1]} (n={len(tr_w)})  "
+          f"test={sorted(te_w['Season'].unique())} (n={len(te_w)}, "
+          f"champions={int(te_w['champion'].sum())})  AUC={auc_w:.4f}  "
+          f"best_C={gs_w.best_params_['C']}")
+
+if walk_forward_results:
+    wf_vals = np.array(list(walk_forward_results.values()))
+    print(f"\n  Walk-forward mean AUC = {wf_vals.mean():.4f} +/- {wf_vals.std():.4f} "
+          f"(n={len(wf_vals)} cut points)")
+
+print(f"\n=== FINAL SUMMARY TABLE (matches tab:nba_pr) — reference = {REFERENCE_MODEL_NBA} ===")
+print(f"{'Model':<22} {'AUC':>7} {'95% CI':>18} {'p(DeLong)':>10}")
+for nome, res in resultados_champ.items():
+    m_, lo, hi, _ = bootstrap_auc_ci(y_true_champ, res["y_prob"])
+    p = delong_results_nba[nome]
+    p_str = "---" if p is None else f"{p:.3f}"
+    print(f"{nome:<22} {res['auc']:>7.3f} [{lo:.3f}, {hi:.3f}]  {p_str:>10}")
 
 import pandas as pd
 import numpy as np

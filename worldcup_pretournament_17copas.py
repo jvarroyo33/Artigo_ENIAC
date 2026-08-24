@@ -41,6 +41,8 @@ O dataset `martj42/international_results` usa nomes unificados:
 import os, warnings, urllib.request
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 import random, os
@@ -452,7 +454,7 @@ def calc_qual_features(cup_year, start, end, team_set):
     """Computa estatísticas de qualificatória por time na janela dada."""
     w = quals[(quals["date"] >= start) & (quals["date"] <= end)]
     rows = []
-    for team in team_set:
+    for team in sorted(team_set):
         h   = w[w["home_team"] == team]
         a   = w[w["away_team"] == team]
         gp  = len(h) + len(a)
@@ -603,7 +605,7 @@ conf_order = ["CONMEBOL", "UEFA", "CAF", "AFC", "CONCACAF", "OFC"]
 valid = df[(df["q_gp"] > 0) & (df["conf"].isin(conf_order))]
 data_by_conf = [valid[valid["conf"] == c]["q_win_pct"].values for c in conf_order]
 
-bp = ax.boxplot(data_by_conf, labels=conf_order, patch_artist=True,
+bp = ax.boxplot(data_by_conf, tick_labels=conf_order, patch_artist=True,
                 medianprops=dict(color="black", lw=2))
 colors_conf = ["#D62728","#1F77B4","#2CA02C","#FF7F0E","#9467BD","#8C564B"]
 for patch, color in zip(bp["boxes"], colors_conf):
@@ -690,7 +692,7 @@ def train_models(target):
     for name, (model, grid) in MODELS.items():
         Xtr = X_train_sc if name in SCALE_MODELS else X_train.values
         Xte = X_test_sc  if name in SCALE_MODELS else X_test.values
-        gs  = GridSearchCV(model, grid, cv=tscv, scoring="roc_auc", n_jobs=-1)
+        gs  = GridSearchCV(model, grid, cv=tscv, scoring="roc_auc", n_jobs=1)
         gs.fit(Xtr, y_train)
         best   = gs.best_estimator_
         y_prob = best.predict_proba(Xte)[:, 1]
@@ -711,6 +713,38 @@ def train_models(target):
 
 results_final_wc = train_models("reached_final")
 results_champ_wc = train_models("champion")
+
+"""## 10a-bis: Ranking Evaluation (Top-1/Top-3/MRR)"""
+
+def avaliar_ranking_wc(resultados, test_df, target_col, titulo):
+    cups = sorted(test_df["cup"].unique())
+    print(f"\n{'='*65}\n  RANKING EVALUATION — {titulo}\n{'='*65}")
+    summary = []
+    for nome, res in resultados.items():
+        top1 = top3 = 0
+        reciprocal_ranks = []
+        for cup in cups:
+            mask = (test_df["cup"] == cup).values
+            y_s = test_df.loc[mask, target_col].values
+            if y_s.sum() == 0:
+                continue
+            proba = res["y_prob"][mask]
+            ranking = np.argsort(proba)[::-1]
+            positivos = np.where(y_s == 1)[0]
+            melhor_rank = min([np.where(ranking == p)[0][0] for p in positivos]) + 1
+            if melhor_rank == 1: top1 += 1
+            if melhor_rank <= 3: top3 += 1
+            reciprocal_ranks.append(1 / melhor_rank)
+            print(f"  {cup} | {nome:<22} | champion rank: #{melhor_rank:>2}")
+        n = len(cups)
+        mrr = np.mean(reciprocal_ranks)
+        summary.append({"Modelo": nome, "Top-1": f"{top1}/{n}",
+                         "Top-3": f"{top3}/{n}", "MRR": round(mrr, 3)})
+    df_summary = pd.DataFrame(summary)
+    print(df_summary.to_string(index=False))
+    return df_summary
+
+ranking_champ_wc = avaliar_ranking_wc(results_champ_wc, test, "champion", "CHAMPION")
 
 """## 10b: Bootstrap 95% CI para AUC"""
 
@@ -919,6 +953,111 @@ pairs = [
 ]
 for n1, n2 in pairs:
     run_mcnemar(y_true_ch, preds[n1], preds[n2], n1, n2)
+
+"""## 10d-bis: PR Curves (article-style, single panel per target)"""
+
+def plot_pr_curve_single(results, y_true, title, filename):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for name, r in results.items():
+        prec_, rec_, _ = precision_recall_curve(y_true, r["y_prob"])
+        ap = average_precision_score(y_true, r["y_prob"])
+        ax.plot(rec_, prec_, lw=2, label=f"{name} (AP={ap:.3f})")
+    ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.legend(fontsize=11)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(filename, bbox_inches="tight", dpi=150)
+    plt.show()
+
+plot_pr_curve_single(results_champ_wc, y_true_ch,
+                      "Precision-Recall — WC Champion Prediction",
+                      "PR_Curve_WC_Champion.png")
+plot_pr_curve_single(results_final_wc, test["reached_final"].values,
+                      "Precision-Recall — WC Finalist Prediction",
+                      "PR_Curve_WC_Finalist.png")
+
+"""## 10e-bis: DeLong Test (AUC comparison)"""
+
+from scipy import stats
+
+def _compute_midrank(x):
+    J = np.argsort(x)
+    Z = x[J]
+    N = len(x)
+    T = np.zeros(N, dtype=float)
+    i = 0
+    while i < N:
+        j = i
+        while j < N and Z[j] == Z[i]:
+            j += 1
+        T[i:j] = 0.5 * (i + j - 1) + 1
+        i = j
+    T2 = np.empty(N, dtype=float)
+    T2[J] = T
+    return T2
+
+def _fastDeLong(predictions_sorted_transposed, label_1_count):
+    m = label_1_count
+    n = predictions_sorted_transposed.shape[1] - m
+    positive_examples = predictions_sorted_transposed[:, :m]
+    negative_examples = predictions_sorted_transposed[:, m:]
+    k = predictions_sorted_transposed.shape[0]
+    tx = np.empty([k, m], dtype=float)
+    ty = np.empty([k, n], dtype=float)
+    tz = np.empty([k, m + n], dtype=float)
+    for r in range(k):
+        tx[r, :] = _compute_midrank(positive_examples[r, :])
+        ty[r, :] = _compute_midrank(negative_examples[r, :])
+        tz[r, :] = _compute_midrank(predictions_sorted_transposed[r, :])
+    aucs = tz[:, :m].sum(axis=1) / m / n - float(m + 1) / 2.0 / n
+    v01 = (tz[:, :m] - tx[:, :]) / n
+    v10 = 1.0 - (tz[:, m:] - ty[:, :]) / m
+    sx = np.cov(v01)
+    sy = np.cov(v10)
+    delongcov = sx / m + sy / n
+    return aucs, delongcov
+
+def delong_roc_test(y_true, prob_a, prob_b):
+    """Two-sided DeLong test for the difference between two correlated AUCs
+    (same test set, two classifiers). Returns (auc_a, auc_b, p_value)."""
+    y_true = np.array(y_true)
+    order = np.argsort(-y_true, kind="mergesort")
+    y_sorted = y_true[order]
+    m = int(np.sum(y_sorted == 1))
+    pa = np.array(prob_a)[order]
+    pb = np.array(prob_b)[order]
+    preds = np.vstack([pa, pb])
+    aucs, cov = _fastDeLong(preds, m)
+    diff = aucs[0] - aucs[1]
+    var = cov[0, 0] + cov[1, 1] - 2 * cov[0, 1]
+    if var <= 0:
+        return aucs[0], aucs[1], 1.0
+    z = diff / np.sqrt(var)
+    p = 2 * (1 - stats.norm.cdf(abs(z)))
+    return aucs[0], aucs[1], p
+
+REFERENCE_MODEL_WC = "Random Forest"
+print(f"\nDeLong Test — Champion (test {TEST_FROM}–2022), reference = {REFERENCE_MODEL_WC}")
+print("─" * 72)
+delong_results_wc = {}
+ref_prob = results_champ_wc[REFERENCE_MODEL_WC]["y_prob"]
+for name, r in results_champ_wc.items():
+    if name == REFERENCE_MODEL_WC:
+        delong_results_wc[name] = None
+        continue
+    auc_ref, auc_m, p = delong_roc_test(y_true_ch, ref_prob, r["y_prob"])
+    delong_results_wc[name] = p
+    print(f"  {REFERENCE_MODEL_WC:<20} vs {name:<20}  AUC {auc_ref:.3f} vs {auc_m:.3f}  p={p:.4f}")
+
+print(f"\n=== FINAL SUMMARY TABLE (matches tab:wc_pr) — reference = {REFERENCE_MODEL_WC} ===")
+print(f"{'Model':<22} {'AUC':>7} {'95% CI':>18} {'AP':>7} {'p(DeLong)':>10}")
+for name, r in results_champ_wc.items():
+    m_, lo, hi, _ = bootstrap_auc_ci(y_true_ch, r["y_prob"])
+    ap = threshold_results[name][4]
+    p = delong_results_wc[name]
+    p_str = "---" if p is None else f"{p:.3f}"
+    print(f"{name:<22} {r['auc']:>7.3f} [{lo:.3f}, {hi:.3f}]  {ap:>7.3f} {p_str:>10}")
 
 """### 10f: Re-evaluating with a Custom Lower Threshold
 

@@ -4,9 +4,25 @@
 This repository contains the complete source code, data preprocessing pipelines, and computational notebooks used to generate all figures, tables, and metrics presented in the paper *"A Supervised Machine Learning Framework for Sports Championship Prediction: Case Studies in the NBA and FIFA World Cup"*.
 
 ## 📂 Repository Structure
-- `NBA-ENIAC-2026.ipynb`: Complete pipeline for Case Study 1 (NBA 2000–2025), including feature engineering, temporal splitting, model training, probability calibration, and the 2026 forecast.
-- `WorldCup_PreTournament_17Copas.ipynb`: Complete pipeline for Case Study 2 (FIFA World Cup 1958–2022). Includes ELO computation, confederation-level z-score normalization, and advanced robustness analyses (Bootstrap 95% CI, Leave-One-Cup-Out CV, and McNemar's test).
-- `requirements.txt`: Python dependencies required to run the notebooks.
+- `nba_eniac_2026.py`: Complete pipeline for Case Study 1 (NBA 2000–2025), including feature engineering, temporal splitting, model training, probability calibration, statistical validation (DeLong, McNemar, bootstrap 95% CI, walk-forward analysis), and the 2026 forecast.
+- `worldcup_pretournament_17copas.py`: Complete pipeline for Case Study 2 (FIFA World Cup 1958–2022). Includes ELO computation, confederation-level z-score normalization, and robustness analyses (Bootstrap 95% CI, Leave-One-Cup-Out CV, DeLong test, McNemar's test, ranking evaluation).
+- `supplementary_figures/nba/` and `supplementary_figures/world_cup/`: Figures referenced in the paper as supplementary material — exploratory feature distributions/correlations, confusion matrices, calibration diagrams, LOCO-CV plots, and the full 2026 forecast charts. Each is cited from the corresponding section of the paper.
+- `requierements.txt`: Python dependencies required to run the scripts.
+
+Both scripts were exported from the original Colab notebooks (`NBA-ENIAC-2026.ipynb`, `WorldCup_PreTournament_17Copas.ipynb`) and are runnable standalone via `python3 <script>.py`.
+
+### Reproducibility note
+While preparing the ENIAC 2026 camera-ready version, a non-determinism bug was found
+and fixed in the World Cup pipeline: `calc_qual_features()` iterated over a Python
+`set` of team names, whose order depends on the process's hash seed and is not fixed
+by `PYTHONHASHSEED` set mid-script. This made tree-based/kernel model results
+(Random Forest, XGBoost, SVM, KNN) vary slightly between runs, even with fixed random
+seeds — Logistic Regression was unaffected, since its convex optimum doesn't depend on
+row order. The fix (`sorted(team_set)`, plus `n_jobs=1` and single-threaded BLAS env
+vars) makes both pipelines fully deterministic — verified by running each twice and
+diffing the full output logs (0 differences). **All numbers in the published paper
+reflect the corrected, deterministic pipeline.** See `CHANGELOG_COMPRESSAO.md` in this
+repository for the full before/after numbers that changed as a result.
 
 ## ⚙️ Requirements & Setup
 The code was developed and tested in **Python 3.10+** (Google Colab environment). 
